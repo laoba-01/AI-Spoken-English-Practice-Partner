@@ -1,0 +1,39 @@
+# ===== Go =====
+# 编译产物
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+main
+
+# 测试
+*.test
+*.out
+
+# 依赖
+vendor/
+
+# 环境变量
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ===== Node / Vue =====
+node_modules/
+dist/
+.vite/
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+
+# ===== 临时文件 =====
+tmp/
+temp/
+*.log
