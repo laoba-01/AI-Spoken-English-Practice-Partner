@@ -13,12 +13,26 @@ const startTime = ref(0)
 const elapsed = ref('00:00')
 let timer: ReturnType<typeof setInterval> | null = null
 
+function getSupportedMimeType(): string {
+  const types = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/ogg;codecs=opus',
+    'audio/mp4',
+  ]
+  for (const t of types) {
+    if (MediaRecorder.isTypeSupported(t)) {
+      return t
+    }
+  }
+  return '' // 浏览器默认格式
+}
+
 async function startRecording() {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-    const recorder = new MediaRecorder(stream, {
-      mimeType: 'audio/webm;codecs=opus',
-    })
+    const mimeType = getSupportedMimeType()
+    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : {})
 
     chunks.value = []
     recorder.ondataavailable = (e) => {
