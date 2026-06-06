@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useConversationStore } from '@/stores/conversation'
 import AppLayout from '@/layout/AppLayout.vue'
 import type { Scene } from '@/types'
@@ -44,6 +45,24 @@ function sceneLabel(scene: Scene) {
 
 function sceneType(scene: Scene) {
   return scene === 'daily' ? '' : scene === 'business' ? 'warning' : 'danger'
+}
+
+async function deleteConversation(id: number) {
+  try {
+    await ElMessageBox.confirm('确定要删除这个对话吗？删除后无法恢复。', '确认删除', {
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+      type: 'warning',
+    })
+    const ok = await store.deleteConversation(id)
+    if (ok) {
+      ElMessage.success('已删除')
+    } else {
+      ElMessage.error('删除失败')
+    }
+  } catch {
+    // 用户取消
+  }
 }
 </script>
 
@@ -91,10 +110,13 @@ function sceneType(scene: Scene) {
             {{ row.created_at?.slice(0, 19).replace('T', ' ') }}
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="100" fixed="right">
+        <el-table-column label="操作" width="150" fixed="right">
           <template #default="{ row }">
             <el-button text type="primary" size="small" @click.stop="goToChat(row.id)">
               查看
+            </el-button>
+            <el-button text type="danger" size="small" @click.stop="deleteConversation(row.id)">
+              删除
             </el-button>
           </template>
         </el-table-column>

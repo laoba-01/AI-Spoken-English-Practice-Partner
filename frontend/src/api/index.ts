@@ -31,6 +31,12 @@ export async function getConversationHistory(id: number) {
   }>>
 }
 
+/** DELETE /api/conversations/:id — 删除会话 */
+export async function deleteConversation(id: number) {
+  const res = await fetch(`${BASE}/conversations/${id}`, { method: 'DELETE' })
+  return res.json() as Promise<ApiResponse<null>>
+}
+
 /** POST /api/message/text — 文字消息兜底 */
 export async function sendTextMessage(req: TextMessageRequest) {
   const res = await fetch(`${BASE}/message/text`, {

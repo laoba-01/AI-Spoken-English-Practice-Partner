@@ -40,9 +40,9 @@ type ASRResponse struct {
 	} `json:"payload"`
 }
 
-// RecognizeWebM 识别WebM语音（浏览器原生录音格式）
-func (a *AliyunASR) RecognizeWebM(webmData []byte) (string, error) {
-	return a.recognize(webmData, "webm")
+// RecognizeWebM 识别语音（前端已转为 WAV 格式发送，16kHz 单声道 PCM）
+func (a *AliyunASR) RecognizeWebM(data []byte) (string, error) {
+	return a.recognize(data, "wav")
 }
 
 // RecognizeMP3 识别MP3语音文件

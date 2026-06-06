@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useConversationStore } from '@/stores/conversation'
@@ -18,15 +18,12 @@ const wsStore = useWebSocketStore()
 const conversationId = ref(Number(route.params.id))
 const connected = ref(false)
 const streamingContent = ref('')
-
-// 缓存当前流式消息的文本（组件内部使用）
-let currentAssistantContent = ''
+const isAIThinking = ref(false)       // AI 思考中指示
+const lastAIAudioUrl = ref('')        // 最新的 AI 语音 URL，用于自动播放
 
 onMounted(async () => {
-  // 加载历史消息
   await convStore.fetchMessages(conversationId.value)
 
-  // 建立 WebSocket 连接
   try {
     await wsStore.connect(conversationId.value)
     connected.value = true
@@ -34,7 +31,6 @@ onMounted(async () => {
     connected.value = false
   }
 
-  // 注册 WS 消息回调
   wsStore.onMessage(handleWSMessage)
 })
 
@@ -44,24 +40,79 @@ onUnmounted(() => {
 
 function handleWSMessage(msg: WSMessage) {
   switch (msg.type) {
-    case 'asr_result':
-      // 语音识别结果已由 store 保存
+    case 'asr_result': {
+      // 语音识别结果 → 显示为用户消息气泡
+      const recognizedText = msg.text || ''
+      if (recognizedText) {
+        const userMsg: Message = {
+          id: Date.now(),
+          conversation_id: conversationId.value,
+          role: 'user',
+          content: recognizedText,
+          created_at: new Date().toISOString(),
+        }
+        convStore.addMessage(userMsg)
+        // AI 开始思考
+        isAIThinking.value = true
+        streamingContent.value = ''
+      }
       break
-    case 'llm_chunk':
-      currentAssistantContent += msg.text || ''
-      streamingContent.value = currentAssistantContent
+    }
+
+    case 'llm_chunk': {
+      // 收到第一个 chunk 时停止思考动画
+      isAIThinking.value = false
+      streamingContent.value += msg.text || ''
       break
-    case 'audio_result':
-      // TTS 语音地址已由 store 保存
+    }
+
+    case 'audio_result': {
+      const audioUrl = msg.audio_url || ''
+      // 流式结束，固化 AI 消息
+      const content = streamingContent.value
+      if (content || audioUrl) {
+        const aiMsg: Message = {
+          id: Date.now(),
+          conversation_id: conversationId.value,
+          role: 'assistant',
+          content: content || '(语音回复)',
+          audio_url: audioUrl,
+          created_at: new Date().toISOString(),
+        }
+        convStore.addMessage(aiMsg)
+        streamingContent.value = ''
+        isAIThinking.value = false
+
+        // 自动播放 AI 语音
+        if (audioUrl) {
+          lastAIAudioUrl.value = audioUrl
+          nextTick(() => autoPlayAudio(audioUrl))
+        }
+      }
       break
+    }
+
     case 'error':
-      ElMessage.error(msg.message || '系统繁忙')
+      ElMessage.error(msg.message || '系统繁忙，请稍后重试')
+      isAIThinking.value = false
+      streamingContent.value = ''
       break
   }
 }
 
+function autoPlayAudio(url: string) {
+  // 延迟一下确保 DOM 更新
+  setTimeout(() => {
+    const audioEl = document.querySelector(`audio[src="${url}"]`) as HTMLAudioElement
+    if (audioEl) {
+      audioEl.play().catch(() => {
+        // 浏览器可能阻止自动播放，静默处理
+      })
+    }
+  }, 200)
+}
+
 function onSendText(text: string) {
-  // 添加用户消息到列表
   const userMsg: Message = {
     id: Date.now(),
     conversation_id: conversationId.value,
@@ -71,26 +122,34 @@ function onSendText(text: string) {
   }
   convStore.addMessage(userMsg)
 
-  // 重置流式缓存
-  currentAssistantContent = ''
   streamingContent.value = ''
+  isAIThinking.value = true
 
-  // 发送到 WebSocket
   wsStore.sendText(text)
 }
 
 function onSendVoice(blob: Blob) {
-  currentAssistantContent = ''
   streamingContent.value = ''
+  isAIThinking.value = true
+
   wsStore.sendVoice(blob)
 }
 
-// 中间态的 AI 流式消息（插入列表底部）
+// 显示的消息列表（包含流式中的 AI 消息和思考状态）
 const displayMessages = computed(() => {
   const msgs = [...convStore.messages]
-  if (streamingContent.value) {
+  // 如果 AI 正在思考但还没有内容，添加一个占位消息用于显示加载动画
+  if (isAIThinking.value && !streamingContent.value) {
     msgs.push({
       id: -1,
+      conversation_id: conversationId.value,
+      role: 'assistant',
+      content: '...',
+      created_at: new Date().toISOString(),
+    })
+  } else if (streamingContent.value) {
+    msgs.push({
+      id: -2,
       conversation_id: conversationId.value,
       role: 'assistant',
       content: streamingContent.value,
@@ -111,7 +170,10 @@ const displayMessages = computed(() => {
             <el-icon><ArrowLeft /></el-icon>
           </el-button>
           <span class="scene-badge">
-            <el-tag :type="convStore.currentScene === 'daily' ? '' : convStore.currentScene === 'business' ? 'warning' : 'danger'" size="small">
+            <el-tag
+              :type="convStore.currentScene === 'daily' ? '' : convStore.currentScene === 'business' ? 'warning' : 'danger'"
+              size="small"
+            >
               {{ convStore.currentScene === 'daily' ? '日常对话' : convStore.currentScene === 'business' ? '商务英语' : '考试模拟' }}
             </el-tag>
           </span>
@@ -127,11 +189,11 @@ const displayMessages = computed(() => {
       <!-- 消息列表 -->
       <ChatWindow :messages="displayMessages" />
 
-      <!-- 输入区域 -->
+      <!-- 输入区域：大按钮按住说话 + 文字输入兜底 -->
       <div class="input-area">
         <VoiceRecorder @send="onSendVoice" />
         <div class="divider">
-          <span>或</span>
+          <span>或打字输入</span>
         </div>
         <TextInput @send="onSendText" />
       </div>
@@ -182,14 +244,27 @@ const displayMessages = computed(() => {
 .input-area {
   background: #fff;
   border-top: 1px solid #f0f0f0;
-  padding: 16px 20px;
+  padding: 20px 20px 24px;
   display: flex;
+  flex-direction: column;
   align-items: center;
   gap: 16px;
   flex-shrink: 0;
 }
 .divider {
-  font-size: 13px;
+  font-size: 12px;
   color: #c0c4cc;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  max-width: 400px;
+}
+.divider::before,
+.divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: #e8e8e8;
 }
 </style>

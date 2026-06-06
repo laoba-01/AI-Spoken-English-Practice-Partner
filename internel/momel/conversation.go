@@ -109,6 +109,41 @@ func GetConversationsByUserID(userID int64, scene string) ([]Conversation, error
 	return result, nil
 }
 
+// 删除会话及其所有消息
+func DeleteConversation(conversationID int64) error {
+	if DB != nil {
+		_, err := DB.Exec("DELETE FROM user_messages WHERE conversation_id = ?", conversationID)
+		if err != nil {
+			return err
+		}
+		_, err = DB.Exec("DELETE FROM user_conversations WHERE id = ?", conversationID)
+		return err
+	}
+
+	// 内存 fallback
+	memMu.Lock()
+	defer memMu.Unlock()
+
+	// 删除消息
+	var filteredMsgs []Message
+	for _, m := range memMessages {
+		if m.ConversationID != conversationID {
+			filteredMsgs = append(filteredMsgs, m)
+		}
+	}
+	memMessages = filteredMsgs
+
+	// 删除会话
+	var filteredConvs []Conversation
+	for _, c := range memConversations {
+		if c.ID != conversationID {
+			filteredConvs = append(filteredConvs, c)
+		}
+	}
+	memConversations = filteredConvs
+	return nil
+}
+
 // 保存消息
 func SaveMessage(conversationID int64, role, content, audioURL string) error {
 	if DB != nil {

@@ -45,7 +45,8 @@ function onKeydown(e: KeyboardEvent) {
 
 <style scoped>
 .text-input-wrap {
-  flex: 1;
+  width: 100%;
+  max-width: 500px;
 }
 .hint {
   font-size: 11px;

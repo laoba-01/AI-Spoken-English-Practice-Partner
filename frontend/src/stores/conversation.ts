@@ -80,6 +80,19 @@ export const useConversationStore = defineStore('conversation', () => {
     messages.value.push(msg)
   }
 
+  /** 删除会话 */
+  async function deleteConversation(id: number) {
+    const res = await api.deleteConversation(id)
+    if (res.code === 0) {
+      conversations.value = conversations.value.filter(c => c.id !== id)
+      if (currentConversation.value?.id === id) {
+        currentConversation.value = null
+        messages.value = []
+      }
+    }
+    return res.code === 0
+  }
+
   /** 清空消息 */
   function clearMessages() {
     messages.value = []
@@ -98,5 +111,6 @@ export const useConversationStore = defineStore('conversation', () => {
     fetchMessages,
     addMessage,
     clearMessages,
+    deleteConversation,
   }
 })

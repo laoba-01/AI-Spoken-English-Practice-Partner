@@ -93,6 +93,7 @@ func main() {
 		api.GET("/conversations", ListConversationsHandler)
 		api.GET("/conversations/:id", GetConversationHandler)
 		api.POST("/message/text", TextMessageHandler)
+		api.DELETE("/conversations/:id", DeleteConversationHandler)
 	}
 
 	// 启动服务
@@ -452,4 +453,19 @@ func TextMessageHandler(c *gin.Context) {
 			"audio_url": audioURL,
 		},
 	})
+}
+
+// DeleteConversationHandler DELETE /api/conversations/:id
+func DeleteConversationHandler(c *gin.Context) {
+	idStr := c.Param("id")
+	var id int64
+	fmt.Sscanf(idStr, "%d", &id)
+
+	if err := model.DeleteConversation(id); err != nil {
+		log.Println("删除会话失败:", err)
+		c.JSON(500, gin.H{"code": -1, "message": "删除失败"})
+		return
+	}
+
+	c.JSON(200, gin.H{"code": 0, "message": "success"})
 }
