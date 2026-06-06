@@ -49,8 +49,15 @@ func main() {
 	}
 
 	// 初始化LLM客户端
-	config := openai.DefaultConfig("ark-a0167170-badd-4b03-8e0c-1da1f1781927-3d5f8")
-	config.BaseURL = "https://ark.cn-beijing.volces.com/api/v3"
+	llmAPIKey := os.Getenv("DOUBAO_API_KEY")
+	if llmAPIKey == "" {
+		log.Fatal("❌ 缺少 DOUBAO_API_KEY 环境变量，请在 .env 中配置")
+	}
+	config := openai.DefaultConfig(llmAPIKey)
+	config.BaseURL = os.Getenv("DOUBAO_BASE_URL")
+	if config.BaseURL == "" {
+		config.BaseURL = "https://ark.cn-beijing.volces.com/api/v3"
+	}
 	llmClient = openai.NewClientWithConfig(config)
 
 	// 初始化ASR客户端
@@ -78,6 +85,15 @@ func main() {
 	// WebSocket接口
 	r.GET("/ws/chat", WebSocketHandler)
 	r.GET("/ws/chat/:id", WebSocketHandler)
+
+	// REST API接口
+	api := r.Group("/api")
+	{
+		api.POST("/conversations", CreateConversationHandler)
+		api.GET("/conversations", ListConversationsHandler)
+		api.GET("/conversations/:id", GetConversationHandler)
+		api.POST("/message/text", TextMessageHandler)
+	}
 
 	// 启动服务
 	log.Println("服务器启动在 :8080")
@@ -258,4 +274,182 @@ func streamLLM(userText string, conn *websocket.Conn) (string, error) {
 	}
 
 	return fullText.String(), nil
+}
+
+// ==================== REST API Handlers ====================
+
+// CreateConversationHandler POST /api/conversations
+func CreateConversationHandler(c *gin.Context) {
+	var req struct {
+		UserID int64  `json:"user_id"`
+		Scene  string `json:"scene"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"code": -1, "message": "invalid request"})
+		return
+	}
+
+	id, err := model.CreateConversation(req.UserID, req.Scene)
+	if err != nil {
+		log.Println("创建会话失败:", err)
+		c.JSON(500, gin.H{"code": -1, "message": "创建失败"})
+		return
+	}
+
+	c.JSON(200, gin.H{
+		"code":    0,
+		"message": "success",
+		"data": gin.H{
+			"conversation_id": id,
+			"created_at":      time.Now().Format("2006-01-02T15:04:05Z"),
+		},
+	})
+}
+
+// ListConversationsHandler GET /api/conversations?user_id=&scene=
+func ListConversationsHandler(c *gin.Context) {
+	userIDStr := c.Query("user_id")
+	scene := c.DefaultQuery("scene", "")
+
+	var userID int64
+	fmt.Sscanf(userIDStr, "%d", &userID)
+
+	convs, err := model.GetConversationsByUserID(userID, scene)
+	if err != nil {
+		log.Println("获取会话列表失败:", err)
+		c.JSON(500, gin.H{"code": -1, "message": "获取失败"})
+		return
+	}
+	if convs == nil {
+		convs = []model.Conversation{}
+	}
+
+	c.JSON(200, gin.H{
+		"code":    0,
+		"message": "success",
+		"data":    convs,
+	})
+}
+
+// GetConversationHandler GET /api/conversations/:id
+func GetConversationHandler(c *gin.Context) {
+	idStr := c.Param("id")
+	var id int64
+	fmt.Sscanf(idStr, "%d", &id)
+
+	messages, err := model.GetMessagesByConversationID(id)
+	if err != nil {
+		log.Println("获取会话历史失败:", err)
+		c.JSON(500, gin.H{"code": -1, "message": "获取失败"})
+		return
+	}
+	if messages == nil {
+		messages = []model.Message{}
+	}
+
+	// 获取会话基本信息
+	convs, _ := model.GetConversationsByUserID(0, "")
+	scene := "daily"
+	title := ""
+	for _, conv := range convs {
+		if conv.ID == id {
+			scene = conv.Scene
+			title = conv.Title
+			break
+		}
+	}
+
+	c.JSON(200, gin.H{
+		"code":    0,
+		"message": "success",
+		"data": gin.H{
+			"conversation_id": id,
+			"scene":           scene,
+			"title":           title,
+			"messages":        messages,
+		},
+	})
+}
+
+// TextMessageHandler POST /api/message/text (文字兜底)
+func TextMessageHandler(c *gin.Context) {
+	var req struct {
+		ConversationID int64  `json:"conversation_id"`
+		Content        string `json:"content"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"code": -1, "message": "invalid request"})
+		return
+	}
+
+	// 保存用户消息
+	if req.ConversationID > 0 {
+		model.SaveMessage(req.ConversationID, "user", req.Content, "")
+	}
+
+	// 调用 LLM（非流式，通过管道收集）
+	pr, pw := io.Pipe()
+	var fullText strings.Builder
+
+	go func() {
+		defer pw.Close()
+		req := openai.ChatCompletionRequest{
+			Model: "doubao-seed-2-0-pro-260215",
+			Messages: []openai.ChatCompletionMessage{
+				{Role: openai.ChatMessageRoleSystem, Content: DailyPrompt},
+				{Role: openai.ChatMessageRoleUser, Content: req.Content},
+			},
+			Stream:      true,
+			Temperature: 0.7,
+			MaxTokens:   500,
+		}
+		stream, err := llmClient.CreateChatCompletionStream(context.Background(), req)
+		if err != nil {
+			return
+		}
+		defer stream.Close()
+		for {
+			resp, err := stream.Recv()
+			if err != nil {
+				break
+			}
+			if len(resp.Choices) > 0 && resp.Choices[0].Delta.Content != "" {
+				pw.Write([]byte(resp.Choices[0].Delta.Content))
+			}
+		}
+	}()
+
+	data := make([]byte, 4096)
+	for {
+		n, err := pr.Read(data)
+		if err != nil {
+			break
+		}
+		fullText.Write(data[:n])
+	}
+
+	// TTS 合成
+	audioURL := ""
+	audioData, err := ttsClient.TextToMP3(fullText.String())
+	if err == nil {
+		filename := fmt.Sprintf("tts_%d.mp3", time.Now().UnixNano())
+		path := fmt.Sprintf("./audio/%s", filename)
+		if os.WriteFile(path, audioData, 0644) == nil {
+			audioURL = fmt.Sprintf("/audio/%s", filename)
+		}
+	}
+
+	// 保存 AI 消息
+	if req.ConversationID > 0 {
+		model.SaveMessage(req.ConversationID, "assistant", fullText.String(), audioURL)
+	}
+
+	c.JSON(200, gin.H{
+		"code":    0,
+		"message": "success",
+		"data": gin.H{
+			"content":   fullText.String(),
+			"audio_url": audioURL,
+		},
+	})
 }
