@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 )
@@ -26,7 +27,7 @@ func NewAliyunOSS() *AliyunOSS {
 		return nil
 	}
 
-	client, err := oss.New(endpoint, accessKeyID, accessKeySecret)
+	client, err := oss.New("https://"+endpoint, accessKeyID, accessKeySecret)
 	if err != nil {
 		log.Println("⚠ OSS 客户端创建失败，音频文件存储在本地:", err)
 		return nil
@@ -49,13 +50,11 @@ func (o *AliyunOSS) UploadMP3(data []byte, filename string) (string, error) {
 		return "", fmt.Errorf("OSS上传失败: %w", err)
 	}
 
-	// 如果有自定义域名则用，否则用默认 OSS 域名
-	domain := os.Getenv("ALIYUN_OSS_DOMAIN")
-	if domain == "" {
-		endpoint := os.Getenv("ALIYUN_OSS_ENDPOINT")
-		bucketName := os.Getenv("ALIYUN_OSS_BUCKET")
-		domain = fmt.Sprintf("https://%s.%s", bucketName, endpoint)
+	// 生成签名 URL（1小时有效），私有 bucket 也能访问
+	signedURL, err := o.bucket.SignURL(key, oss.HTTPGet, int64((1 * time.Hour).Seconds()))
+	if err != nil {
+		return "", fmt.Errorf("OSS签名URL生成失败: %w", err)
 	}
 
-	return fmt.Sprintf("%s/%s", domain, key), nil
+	return signedURL, nil
 }
