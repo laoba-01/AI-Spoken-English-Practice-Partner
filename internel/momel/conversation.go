@@ -42,6 +42,8 @@ func CreateConversation(userID int64, scene string) (int64, error) {
 		ctx := context.Background()
 		key := fmt.Sprintf("conv:list:%d:%s", userID, scene)
 		RedisClient.Del(ctx, key)
+		// 也删除"全部场景"的缓存 key
+		RedisClient.Del(ctx, fmt.Sprintf("conv:list:%d:", userID))
 	}
 	return id, nil
 }
@@ -246,9 +248,10 @@ func DeleteConversation(conversationID int64) error {
 		ctx := context.Background()
 		// 删除消息缓存
 		RedisClient.Del(ctx, fmt.Sprintf("conv:msgs:%d", conversationID))
-		// 删除会话列表缓存
+		// 删除会话列表缓存（指定场景 + 全部场景）
 		if targetUserID > 0 {
 			RedisClient.Del(ctx, fmt.Sprintf("conv:list:%d:%s", targetUserID, targetScene))
+			RedisClient.Del(ctx, fmt.Sprintf("conv:list:%d:", targetUserID))
 		}
 	}
 	return nil
