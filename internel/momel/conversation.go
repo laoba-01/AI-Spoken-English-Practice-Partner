@@ -1,10 +1,19 @@
 // internal/model/conversation.go
 package model
 
-import "database/sql"
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"time"
+)
 
 // 创建新会话
 func CreateConversation(userID int64, scene string) (int64, error) {
+	var id int64
+	var dbErr error
+
 	if DB != nil {
 		res, err := DB.Exec(
 			"INSERT INTO user_conversations (user_id, scene) VALUES (?, ?)",
@@ -13,22 +22,47 @@ func CreateConversation(userID int64, scene string) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
-		return res.LastInsertId()
+		id, dbErr = res.LastInsertId()
+		if dbErr != nil {
+			return 0, dbErr
+		}
+	} else {
+		// 内存 fallback
+		memMu.Lock()
+		id = memConvIDSeq
+		memConvIDSeq++
+		memConversations = append(memConversations, Conversation{
+			ID: id, UserID: userID, Scene: scene, Title: "", CreatedAt: memNow(),
+		})
+		memMu.Unlock()
 	}
 
-	// 内存 fallback
-	memMu.Lock()
-	defer memMu.Unlock()
-	id := memConvIDSeq
-	memConvIDSeq++
-	memConversations = append(memConversations, Conversation{
-		ID: id, UserID: userID, Scene: scene, Title: "", CreatedAt: memNow(),
-	})
+	// 删除缓存（使下次列表查询重建）
+	if RedisClient != nil {
+		ctx := context.Background()
+		key := fmt.Sprintf("conv:list:%d:%s", userID, scene)
+		RedisClient.Del(ctx, key)
+	}
 	return id, nil
 }
 
 // 获取会话历史消息
 func GetMessagesByConversationID(conversationID int64) ([]Message, error) {
+	ctx := context.Background()
+
+	// ① Redis 缓存查询
+	if RedisClient != nil {
+		key := fmt.Sprintf("conv:msgs:%d", conversationID)
+		cached, err := RedisClient.Get(ctx, key).Result()
+		if err == nil {
+			var msgs []Message
+			if json.Unmarshal([]byte(cached), &msgs) == nil {
+				return msgs, nil
+			}
+		}
+	}
+
+	// ② 查 MySQL / 内存（原有逻辑）
 	if DB != nil {
 		rows, err := DB.Query(
 			"SELECT id, conversation_id, role, content, audio_url, created_at FROM user_messages WHERE conversation_id = ? ORDER BY id ASC",
@@ -50,6 +84,14 @@ func GetMessagesByConversationID(conversationID int64) ([]Message, error) {
 			}
 			messages = append(messages, msg)
 		}
+
+		// ③ 回填 Redis
+		if RedisClient != nil && messages != nil {
+			key := fmt.Sprintf("conv:msgs:%d", conversationID)
+			if data, err := json.Marshal(messages); err == nil {
+				RedisClient.Set(ctx, key, data, 2*time.Minute)
+			}
+		}
 		return messages, nil
 	}
 
@@ -62,11 +104,34 @@ func GetMessagesByConversationID(conversationID int64) ([]Message, error) {
 			result = append(result, m)
 		}
 	}
+
+	// ③ 回填 Redis
+	if RedisClient != nil && result != nil {
+		key := fmt.Sprintf("conv:msgs:%d", conversationID)
+		if data, err := json.Marshal(result); err == nil {
+			RedisClient.Set(ctx, key, data, 2*time.Minute)
+		}
+	}
 	return result, nil
 }
 
 // 获取用户会话列表
 func GetConversationsByUserID(userID int64, scene string) ([]Conversation, error) {
+	ctx := context.Background()
+
+	// ① Redis 缓存查询
+	if RedisClient != nil {
+		key := fmt.Sprintf("conv:list:%d:%s", userID, scene)
+		cached, err := RedisClient.Get(ctx, key).Result()
+		if err == nil {
+			var convs []Conversation
+			if json.Unmarshal([]byte(cached), &convs) == nil {
+				return convs, nil
+			}
+		}
+	}
+
+	// ② 查 MySQL / 内存（原有逻辑）
 	if DB != nil {
 		var rows *sql.Rows
 		var err error
@@ -94,6 +159,14 @@ func GetConversationsByUserID(userID int64, scene string) ([]Conversation, error
 			}
 			convs = append(convs, c)
 		}
+
+		// ③ 回填 Redis
+		if RedisClient != nil && convs != nil {
+			key := fmt.Sprintf("conv:list:%d:%s", userID, scene)
+			if data, err := json.Marshal(convs); err == nil {
+				RedisClient.Set(ctx, key, data, 5*time.Minute)
+			}
+		}
 		return convs, nil
 	}
 
@@ -106,41 +179,78 @@ func GetConversationsByUserID(userID int64, scene string) ([]Conversation, error
 			result = append(result, c)
 		}
 	}
+
+	// ③ 回填 Redis（内存结果也缓存）
+	if RedisClient != nil && result != nil {
+		key := fmt.Sprintf("conv:list:%d:%s", userID, scene)
+		if data, err := json.Marshal(result); err == nil {
+			RedisClient.Set(ctx, key, data, 5*time.Minute)
+		}
+	}
 	return result, nil
 }
 
 // 删除会话及其所有消息
 func DeleteConversation(conversationID int64) error {
+	// ① 删除前查出会话信息（用于缓存失效）
+	var targetUserID int64
+	var targetScene string
+
 	if DB != nil {
+		row := DB.QueryRow(
+			"SELECT user_id, scene FROM user_conversations WHERE id = ?",
+			conversationID,
+		)
+		row.Scan(&targetUserID, &targetScene)
+
 		_, err := DB.Exec("DELETE FROM user_messages WHERE conversation_id = ?", conversationID)
 		if err != nil {
 			return err
 		}
 		_, err = DB.Exec("DELETE FROM user_conversations WHERE id = ?", conversationID)
-		return err
+		if err != nil {
+			return err
+		}
+	} else {
+		// 内存 fallback
+		memMu.Lock()
+		// 先查会话信息
+		for _, c := range memConversations {
+			if c.ID == conversationID {
+				targetUserID = c.UserID
+				targetScene = c.Scene
+				break
+			}
+		}
+		// 删除消息
+		var filteredMsgs []Message
+		for _, m := range memMessages {
+			if m.ConversationID != conversationID {
+				filteredMsgs = append(filteredMsgs, m)
+			}
+		}
+		memMessages = filteredMsgs
+		// 删除会话
+		var filteredConvs []Conversation
+		for _, c := range memConversations {
+			if c.ID != conversationID {
+				filteredConvs = append(filteredConvs, c)
+			}
+		}
+		memConversations = filteredConvs
+		memMu.Unlock()
 	}
 
-	// 内存 fallback
-	memMu.Lock()
-	defer memMu.Unlock()
-
-	// 删除消息
-	var filteredMsgs []Message
-	for _, m := range memMessages {
-		if m.ConversationID != conversationID {
-			filteredMsgs = append(filteredMsgs, m)
+	// ② 删除缓存
+	if RedisClient != nil {
+		ctx := context.Background()
+		// 删除消息缓存
+		RedisClient.Del(ctx, fmt.Sprintf("conv:msgs:%d", conversationID))
+		// 删除会话列表缓存
+		if targetUserID > 0 {
+			RedisClient.Del(ctx, fmt.Sprintf("conv:list:%d:%s", targetUserID, targetScene))
 		}
 	}
-	memMessages = filteredMsgs
-
-	// 删除会话
-	var filteredConvs []Conversation
-	for _, c := range memConversations {
-		if c.ID != conversationID {
-			filteredConvs = append(filteredConvs, c)
-		}
-	}
-	memConversations = filteredConvs
 	return nil
 }
 
@@ -151,21 +261,30 @@ func SaveMessage(conversationID int64, role, content, audioURL string) error {
 			"INSERT INTO user_messages (conversation_id, role, content, audio_url) VALUES (?, ?, ?, ?)",
 			conversationID, role, content, audioURL,
 		)
-		return err
+		if err != nil {
+			return err
+		}
+	} else {
+		// 内存 fallback
+		memMu.Lock()
+		id := memMsgIDSeq
+		memMsgIDSeq++
+		memMessages = append(memMessages, Message{
+			ID:             id,
+			ConversationID: conversationID,
+			Role:           role,
+			Content:        content,
+			AudioURL:       audioURL,
+			CreatedAt:      memNow(),
+		})
+		memMu.Unlock()
 	}
 
-	// 内存 fallback
-	memMu.Lock()
-	defer memMu.Unlock()
-	id := memMsgIDSeq
-	memMsgIDSeq++
-	memMessages = append(memMessages, Message{
-		ID:             id,
-		ConversationID: conversationID,
-		Role:           role,
-		Content:        content,
-		AudioURL:       audioURL,
-		CreatedAt:      memNow(),
-	})
+	// 删除消息缓存（下次查询时重建）
+	if RedisClient != nil {
+		ctx := context.Background()
+		key := fmt.Sprintf("conv:msgs:%d", conversationID)
+		RedisClient.Del(ctx, key)
+	}
 	return nil
 }
