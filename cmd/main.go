@@ -110,7 +110,9 @@ func main() {
 	os.MkdirAll("./audio", 0755)
 
 	// 创建Gin路由
-	r := gin.Default()
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(requestLogger())
 
 	// 静态文件服务：提供TTS生成的音频文件
 	r.Static("/audio", "./audio")
@@ -150,6 +152,21 @@ func logTTSStatus() {
 	}
 }
 
+// requestLogger Gin 请求日志中间件
+func requestLogger() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		c.Next()
+		log.Printf("[%s] %s %s | %d | %.3fs",
+			c.Request.Method,
+			c.Request.URL.Path,
+			c.ClientIP(),
+			c.Writer.Status(),
+			time.Since(start).Seconds(),
+		)
+	}
+}
+
 // WebSocketHandler WebSocket处理函数
 func WebSocketHandler(c *gin.Context) {
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
@@ -181,7 +198,9 @@ func WebSocketHandler(c *gin.Context) {
 			// === 语音消息：ASR → 发送识别结果 ===
 			log.Printf("收到语音消息，大小: %d bytes", len(msg))
 
+			asrStart := time.Now()
 			recognizedText, err := asrClient.RecognizeWebM(msg)
+			log.Printf("ASR耗时: %.2fs, 文本: %s", time.Since(asrStart).Seconds(), recognizedText)
 			if err != nil {
 				log.Println("ASR识别失败:", err)
 				conn.WriteJSON(map[string]interface{}{
@@ -240,7 +259,9 @@ func WebSocketHandler(c *gin.Context) {
 		log.Println("AI回复:", fullText)
 
 		// === TTS 语音合成 ===
+		ttsStart := time.Now()
 		audioData, err := ttsClient.TextToMP3(fullText)
+		log.Printf("TTS耗时: %.2fs", time.Since(ttsStart).Seconds())
 		if err != nil {
 			log.Println("TTS合成失败（AI文字回复已发送，跳过语音）:", err)
 			// 保存文字消息（无语音）
@@ -289,7 +310,41 @@ func WebSocketHandler(c *gin.Context) {
 	log.Println("客户端断开连接")
 }
 
-// streamLLM 调用豆包LLM流式生成，实时推送每个chunk到前端
+// ─── LLM 重试配置 ───
+
+const (
+	llmMaxRetries    = 2
+	llmRetryDelay    = 500 * time.Millisecond
+	llmTimeout       = 30 * time.Second
+	contentSafetyMax = 1 // 内容安全拦截最多重试1次
+)
+
+func isRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "timeout:") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "EOF") ||
+		strings.Contains(msg, "broken pipe")
+}
+
+func isContentSafety(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "content_filter") ||
+		strings.Contains(msg, "content_policy") ||
+		strings.Contains(msg, "safety") ||
+		strings.Contains(msg, "敏感词") ||
+		strings.Contains(msg, "安全拦截")
+}
+
+// streamLLM 调用豆包LLM流式生成，实时推送每个chunk到前端（含重试）
 func streamLLM(systemPrompt string, history []model.Message, userText string, conn *websocket.Conn) (string, error) {
 	messages := []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
@@ -305,45 +360,83 @@ func streamLLM(systemPrompt string, history []model.Message, userText string, co
 		Content: userText,
 	})
 
-	req := openai.ChatCompletionRequest{
-		Model:    "doubao-seed-2-0-pro-260215",
-		Messages: messages,
-		Stream:      true,
-		Temperature: 0.7,
-		MaxTokens:   500,
-	}
+	var lastErr error
+	safetyRetries := 0
 
-	stream, err := llmClient.CreateChatCompletionStream(context.Background(), req)
-	if err != nil {
-		return "", err
-	}
-	defer stream.Close()
+	for attempt := 0; attempt <= llmMaxRetries; attempt++ {
+		if attempt > 0 {
+			log.Printf("LLM重试 %d/%d (错误: %v)", attempt, llmMaxRetries, lastErr)
+			time.Sleep(llmRetryDelay)
+		}
 
-	var fullText strings.Builder
-	for {
-		resp, err := stream.Recv()
+		ctx, cancel := context.WithTimeout(context.Background(), llmTimeout)
+		req := openai.ChatCompletionRequest{
+			Model:       "doubao-seed-2-0-pro-260215",
+			Messages:    messages,
+			Stream:      true,
+			Temperature: 0.7,
+			MaxTokens:   500,
+		}
+
+		stream, err := llmClient.CreateChatCompletionStream(ctx, req)
 		if err != nil {
-			if err == io.EOF {
-				// 流正常结束
+			cancel()
+			lastErr = err
+			if isContentSafety(err) && safetyRetries < contentSafetyMax {
+				safetyRetries++
+				log.Println("⚠ 高考内容安全拦截，重试中...")
+				continue
+			}
+			if isRetryable(err) {
+				continue
+			}
+			return "", err
+		}
+
+		startTime := time.Now()
+		var fullText strings.Builder
+		streamOK := true
+
+		for {
+			resp, err := stream.Recv()
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				log.Println("流读取错误:", err)
+				lastErr = err
+				streamOK = false
+				if isContentSafety(err) && safetyRetries < contentSafetyMax {
+					safetyRetries++
+					log.Println("⚠ 高考内容安全拦截(流)，重试中...")
+				}
 				break
 			}
-			log.Println("流读取错误:", err)
-			break
+
+			if len(resp.Choices) > 0 && resp.Choices[0].Delta.Content != "" {
+				chunk := resp.Choices[0].Delta.Content
+				fullText.WriteString(chunk)
+				conn.WriteJSON(map[string]interface{}{
+					"type": "llm_chunk",
+					"text": chunk,
+				})
+			}
+		}
+		stream.Close()
+		cancel()
+
+		log.Printf("LLM耗时: %.2fs, 回复长度: %d字", time.Since(startTime).Seconds(), fullText.Len())
+
+		if streamOK {
+			return fullText.String(), nil
 		}
 
-		if len(resp.Choices) > 0 && resp.Choices[0].Delta.Content != "" {
-			chunk := resp.Choices[0].Delta.Content
-			fullText.WriteString(chunk)
-
-			// 流式推送给前端
-			conn.WriteJSON(map[string]interface{}{
-				"type": "llm_chunk",
-				"text": chunk,
-			})
+		if !isRetryable(lastErr) && !isContentSafety(lastErr) {
+			return "", lastErr
 		}
 	}
 
-	return fullText.String(), nil
+	return "", fmt.Errorf("LLM调用失败(已重试%d次): %w", llmMaxRetries, lastErr)
 }
 
 // ==================== REST API Handlers ====================
@@ -485,27 +578,72 @@ func TextMessageHandler(c *gin.Context) {
 
 	go func() {
 		defer pw.Close()
-		llmReq := openai.ChatCompletionRequest{
-			Model:       "doubao-seed-2-0-pro-260215",
-			Messages:    messages,
-			Stream:      true,
-			Temperature: 0.7,
-			MaxTokens:   500,
-		}
-		stream, err := llmClient.CreateChatCompletionStream(context.Background(), llmReq)
-		if err != nil {
-			return
-		}
-		defer stream.Close()
-		for {
-			resp, err := stream.Recv()
+
+		var lastErr error
+		safetyRetries := 0
+		startTime := time.Now()
+
+		for attempt := 0; attempt <= llmMaxRetries; attempt++ {
+			if attempt > 0 {
+				log.Printf("TextMsg LLM重试 %d/%d (错误: %v)", attempt, llmMaxRetries, lastErr)
+				time.Sleep(llmRetryDelay)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), llmTimeout)
+			llmReq := openai.ChatCompletionRequest{
+				Model:       "doubao-seed-2-0-pro-260215",
+				Messages:    messages,
+				Stream:      true,
+				Temperature: 0.7,
+				MaxTokens:   500,
+			}
+			stream, err := llmClient.CreateChatCompletionStream(ctx, llmReq)
 			if err != nil {
-				break
+				cancel()
+				lastErr = err
+				if isContentSafety(err) && safetyRetries < contentSafetyMax {
+					safetyRetries++
+					log.Println("⚠ 高考内容安全拦截(TextMsg)，重试中...")
+					continue
+				}
+				if isRetryable(err) {
+					continue
+				}
+				return
 			}
-			if len(resp.Choices) > 0 && resp.Choices[0].Delta.Content != "" {
-				pw.Write([]byte(resp.Choices[0].Delta.Content))
+
+			streamOK := true
+			for {
+				resp, err := stream.Recv()
+				if err != nil {
+					if err == io.EOF {
+						break
+					}
+					lastErr = err
+					streamOK = false
+					if isContentSafety(err) && safetyRetries < contentSafetyMax {
+						safetyRetries++
+						log.Println("⚠ 高考内容安全拦截(TextMsg流)，重试中...")
+					}
+					break
+				}
+				if len(resp.Choices) > 0 && resp.Choices[0].Delta.Content != "" {
+					pw.Write([]byte(resp.Choices[0].Delta.Content))
+				}
+			}
+			stream.Close()
+			cancel()
+
+			if streamOK {
+				log.Printf("TextMsg LLM耗时: %.2fs", time.Since(startTime).Seconds())
+				return
+			}
+
+			if !isRetryable(lastErr) && !isContentSafety(lastErr) {
+				return
 			}
 		}
+		log.Printf("TextMsg LLM调用失败(已重试%d次): %v", llmMaxRetries, lastErr)
 	}()
 
 	data := make([]byte, 4096)
@@ -519,7 +657,9 @@ func TextMessageHandler(c *gin.Context) {
 
 	// TTS 合成 + 存储（优先 OSS → 本地降级）
 	audioURL := ""
+	ttsStart := time.Now()
 	audioData, err := ttsClient.TextToMP3(fullText.String())
+	log.Printf("TextMsg TTS耗时: %.2fs", time.Since(ttsStart).Seconds())
 	if err == nil {
 		filename := fmt.Sprintf("tts_%d.mp3", time.Now().UnixNano())
 		if ossClient != nil {
