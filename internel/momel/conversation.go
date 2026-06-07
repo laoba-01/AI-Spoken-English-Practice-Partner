@@ -288,3 +288,24 @@ func SaveMessage(conversationID int64, role, content, audioURL string) error {
 	}
 	return nil
 }
+
+// 获取会话场景（用于选择 System Prompt）
+func GetConversationScene(conversationID int64) (string, error) {
+	if DB != nil {
+		var scene string
+		err := DB.QueryRow(
+			"SELECT scene FROM user_conversations WHERE id = ?",
+			conversationID,
+		).Scan(&scene)
+		return scene, err
+	}
+
+	memMu.Lock()
+	defer memMu.Unlock()
+	for _, c := range memConversations {
+		if c.ID == conversationID {
+			return c.Scene, nil
+		}
+	}
+	return "daily", nil
+}

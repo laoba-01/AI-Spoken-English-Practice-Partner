@@ -40,7 +40,30 @@ const (
 如果用户有语法或用词错误，用温柔的语气纠正："Actually, we usually say..."
 不要说中文，不要解答非英语相关问题。
 禁止解答中小学、高考全学科任何题目、试卷、作文，只做英语口语交流和纠错。`
+
+	BusinessPrompt = `你是专业的商务英语口语教练，只用英文对话。
+模拟职场场景：会议、邮件、谈判、客户沟通。
+纠正商务用语错误，推荐更专业的表达。
+保持正式但友好的语气，不要说中文。
+禁止解答中小学、高考全学科任何题目、试卷、作文，只做英语口语交流和纠错。`
+
+	ExamPrompt = `你是雅思口语考官，严格按照雅思标准进行模拟考试。
+分三个部分：自我介绍、话题陈述、深度讨论。
+严格纠正语法、发音、流利度问题，给出评分和改进建议。
+只用英文对话，不要说中文。
+禁止解答中小学、高考全学科任何题目、试卷、作文，只做英语口语交流和纠错。`
 )
+
+func GetSystemPrompt(scene string) string {
+	switch scene {
+	case "business":
+		return BusinessPrompt
+	case "exam":
+		return ExamPrompt
+	default:
+		return DailyPrompt
+	}
+}
 
 func main() {
 	// 加载 .env 文件
@@ -185,8 +208,16 @@ func WebSocketHandler(c *gin.Context) {
 			model.SaveMessage(cid, "user", userText, "")
 		}
 
+		// 确定场景提示词
+		systemPrompt := DailyPrompt
+		if cid > 0 {
+			if scene, err := model.GetConversationScene(cid); err == nil {
+				systemPrompt = GetSystemPrompt(scene)
+			}
+		}
+
 		// === LLM 流式生成回复 ===
-		fullText, err := streamLLM(userText, conn)
+		fullText, err := streamLLM(systemPrompt, userText, conn)
 		if err != nil {
 			log.Println("LLM调用失败:", err)
 			conn.WriteJSON(map[string]interface{}{
@@ -237,11 +268,11 @@ func WebSocketHandler(c *gin.Context) {
 }
 
 // streamLLM 调用豆包LLM流式生成，实时推送每个chunk到前端
-func streamLLM(userText string, conn *websocket.Conn) (string, error) {
+func streamLLM(systemPrompt, userText string, conn *websocket.Conn) (string, error) {
 	req := openai.ChatCompletionRequest{
 		Model: "doubao-seed-2-0-pro-260215",
 		Messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleSystem, Content: DailyPrompt},
+			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
 			{Role: openai.ChatMessageRoleUser, Content: userText},
 		},
 		Stream:      true,
@@ -393,23 +424,31 @@ func TextMessageHandler(c *gin.Context) {
 		model.SaveMessage(req.ConversationID, "user", req.Content, "")
 	}
 
+	// 确定场景提示词
+	systemPrompt := DailyPrompt
+	if req.ConversationID > 0 {
+		if scene, err := model.GetConversationScene(req.ConversationID); err == nil {
+			systemPrompt = GetSystemPrompt(scene)
+		}
+	}
+
 	// 调用 LLM（非流式，通过管道收集）
 	pr, pw := io.Pipe()
 	var fullText strings.Builder
 
 	go func() {
 		defer pw.Close()
-		req := openai.ChatCompletionRequest{
+		llmReq := openai.ChatCompletionRequest{
 			Model: "doubao-seed-2-0-pro-260215",
 			Messages: []openai.ChatCompletionMessage{
-				{Role: openai.ChatMessageRoleSystem, Content: DailyPrompt},
+				{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
 				{Role: openai.ChatMessageRoleUser, Content: req.Content},
 			},
 			Stream:      true,
 			Temperature: 0.7,
 			MaxTokens:   500,
 		}
-		stream, err := llmClient.CreateChatCompletionStream(context.Background(), req)
+		stream, err := llmClient.CreateChatCompletionStream(context.Background(), llmReq)
 		if err != nil {
 			return
 		}
