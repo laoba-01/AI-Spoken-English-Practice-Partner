@@ -13,9 +13,26 @@ const startTime = ref(0)
 const elapsed = ref('00:00')
 let timer: ReturnType<typeof setInterval> | null = null
 
+/** 线性插值重采样到 16kHz */
+function resample(data: Float32Array, fromRate: number, toRate: number): Float32Array {
+  if (fromRate === toRate) return data
+  const ratio = fromRate / toRate
+  const newLength = Math.round(data.length / ratio)
+  const result = new Float32Array(newLength)
+  for (let i = 0; i < newLength; i++) {
+    const srcIdx = i * ratio
+    const srcIdxFloor = Math.floor(srcIdx)
+    const srcIdxCeil = Math.min(srcIdxFloor + 1, data.length - 1)
+    const t = srcIdx - srcIdxFloor
+    result[i] = data[srcIdxFloor] * (1 - t) + data[srcIdxCeil] * t
+  }
+  return result
+}
+
 /**
- * 将 WebM/Opus 音频 blob 解码并转换为 WAV 格式（阿里云 ASR 原生支持 WAV）
- * WAV = 44 字节头 + PCM 16bit 单声道数据
+ * WebM/Opus → WAV (16kHz 16bit mono)
+ * 阿里云 ASR 要求 16kHz 采样率，浏览器 AudioContext 可能忽略 sampleRate 提示，
+ * 因此需主动重采样确保输出始终为 16kHz
  */
 async function convertToWav(webmBlob: Blob): Promise<Blob> {
   const audioCtx = new AudioContext({ sampleRate: 16000 })
@@ -23,27 +40,25 @@ async function convertToWav(webmBlob: Blob): Promise<Blob> {
     const arrayBuffer = await webmBlob.arrayBuffer()
     const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer)
 
-    // 提取单声道、16kHz 的 PCM 数据
-    const numChannels = 1
-    const sampleRate = audioBuffer.sampleRate
-    const length = audioBuffer.length
     const pcmData = audioBuffer.getChannelData(0) // Float32Array [-1, 1]
+    const srcRate = audioBuffer.sampleRate
 
-    // 转为 16-bit PCM
-    const byteCount = length * 2 // 16-bit = 2 bytes per sample
+    // 重采样到 16kHz（浏览器可能不遵守 AudioContext 的 sampleRate 提示）
+    const samples = resample(pcmData, srcRate, 16000)
+
+    // 转为 16-bit PCM WAV
+    const outLength = samples.length
+    const byteCount = outLength * 2
     const wavBuffer = new ArrayBuffer(44 + byteCount)
     const view = new DataView(wavBuffer)
 
-    // WAV header
-    writeWavHeader(view, byteCount, sampleRate, numChannels)
+    writeWavHeader(view, byteCount, 16000, 1)
 
-    // PCM data
     let offset = 44
-    for (let i = 0; i < length; i++) {
-      // Float32 [-1,1] → Int16
-      const sample = Math.max(-1, Math.min(1, pcmData[i]))
+    for (let i = 0; i < outLength; i++) {
+      const sample = Math.max(-1, Math.min(1, samples[i]))
       const int16 = sample < 0 ? sample * 0x8000 : sample * 0x7FFF
-      view.setInt16(offset, int16, true) // little-endian
+      view.setInt16(offset, int16, true)
       offset += 2
     }
 
@@ -56,23 +71,17 @@ async function convertToWav(webmBlob: Blob): Promise<Blob> {
 function writeWavHeader(view: DataView, dataLength: number, sampleRate: number, numChannels: number) {
   const byteRate = sampleRate * numChannels * 2
   const blockAlign = numChannels * 2
-
-  // RIFF chunk
   writeString(view, 0, 'RIFF')
   view.setUint32(4, 36 + dataLength, true)
   writeString(view, 8, 'WAVE')
-
-  // fmt sub-chunk
   writeString(view, 12, 'fmt ')
-  view.setUint32(16, 16, true)       // PCM = 16 bytes
-  view.setUint16(20, 1, true)        // PCM format = 1
+  view.setUint32(16, 16, true)
+  view.setUint16(20, 1, true)
   view.setUint16(22, numChannels, true)
   view.setUint32(24, sampleRate, true)
   view.setUint32(28, byteRate, true)
   view.setUint16(32, blockAlign, true)
-  view.setUint16(34, 16, true)       // bits per sample
-
-  // data sub-chunk
+  view.setUint16(34, 16, true)
   writeString(view, 36, 'data')
   view.setUint32(40, dataLength, true)
 }
@@ -118,11 +127,9 @@ async function startRecording() {
 
       const webmBlob = new Blob(chunks.value, { type: 'audio/webm' })
       try {
-        // 转为 WAV 格式发送给阿里云 ASR
         const wavBlob = await convertToWav(webmBlob)
         emit('send', wavBlob)
       } catch (e) {
-        // WAV 转换失败，降级为直接发送 webm
         console.warn('WAV conversion failed, sending webm', e)
         emit('send', webmBlob)
       }

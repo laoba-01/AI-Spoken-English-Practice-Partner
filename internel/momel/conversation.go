@@ -312,3 +312,35 @@ func GetConversationScene(conversationID int64) (string, error) {
 	}
 	return "daily", nil
 }
+
+// UpdateLastUserMessage 更新会话中最后一条用户消息的纠错和评分
+func UpdateLastUserMessage(conversationID int64, correction string, score int) error {
+	if DB != nil {
+		_, err := DB.Exec(
+			"UPDATE user_messages SET correction = ?, pronunciation_score = ? WHERE id = (SELECT id FROM (SELECT id FROM user_messages WHERE conversation_id = ? AND role = 'user' ORDER BY id DESC LIMIT 1) AS t)",
+			correction, score, conversationID,
+		)
+		if err != nil {
+			return err
+		}
+	} else {
+		// 内存 fallback
+		memMu.Lock()
+		defer memMu.Unlock()
+		for i := len(memMessages) - 1; i >= 0; i-- {
+			if memMessages[i].ConversationID == conversationID && memMessages[i].Role == "user" {
+				memMessages[i].Correction = correction
+				memMessages[i].PronunciationScore = int8(score)
+				break
+			}
+		}
+	}
+
+	// 删除缓存
+	if RedisClient != nil {
+		ctx := context.Background()
+		key := fmt.Sprintf("conv:msgs:%d", conversationID)
+		RedisClient.Del(ctx, key)
+	}
+	return nil
+}

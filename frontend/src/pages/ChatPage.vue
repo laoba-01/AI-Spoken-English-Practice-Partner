@@ -20,6 +20,7 @@ const connected = ref(false)
 const streamingContent = ref('')
 const isAIThinking = ref(false)       // AI 思考中指示
 const lastAIAudioUrl = ref('')        // 最新的 AI 语音 URL，用于自动播放
+const interimASRText = ref('')        // ASR 流式中间识别文本
 
 onMounted(async () => {
   await convStore.fetchMessages(conversationId.value)
@@ -40,8 +41,15 @@ onUnmounted(() => {
 
 function handleWSMessage(msg: WSMessage) {
   switch (msg.type) {
+    case 'asr_interim': {
+      // ASR 中间识别结果（边说边转，实时展示）
+      interimASRText.value = msg.text || ''
+      break
+    }
+
     case 'asr_result': {
       // 语音识别结果 → 显示为用户消息气泡
+      interimASRText.value = '' // 清除中间结果
       const recognizedText = msg.text || ''
       if (recognizedText) {
         const userMsg: Message = {
@@ -89,6 +97,19 @@ function handleWSMessage(msg: WSMessage) {
           nextTick(() => autoPlayAudio(audioUrl))
         }
       }
+      break
+    }
+
+    case 'correction_result': {
+      // 纠错分析结果 → 更新最后一条用户消息
+      const corrections = msg.corrections || []
+      const score = msg.pronunciation_score || 0
+      convStore.updateLastUserMessageCorrection(
+        conversationId.value,
+        msg.correction || '',
+        corrections,
+        score
+      )
       break
     }
 
@@ -189,6 +210,12 @@ const displayMessages = computed(() => {
       <!-- 消息列表 -->
       <ChatWindow :messages="displayMessages" />
 
+      <!-- ASR 实时识别中间结果 -->
+      <div v-if="interimASRText" class="interim-asr">
+        <span class="interim-label">识别中...</span>
+        <span class="interim-text">{{ interimASRText }}</span>
+      </div>
+
       <!-- 输入区域：大按钮按住说话 + 文字输入兜底 -->
       <div class="input-area">
         <VoiceRecorder @send="onSendVoice" />
@@ -239,6 +266,27 @@ const displayMessages = computed(() => {
 }
 .dot.online {
   background: #67c23a;
+}
+
+.interim-asr {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 20px;
+  background: #f0f9ff;
+  border-top: 1px solid #b3d8ff;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+.interim-label {
+  color: #909399;
+  font-size: 12px;
+  white-space: nowrap;
+  animation: blink 1s infinite;
+}
+.interim-text {
+  color: #409eff;
+  font-style: italic;
 }
 
 .input-area {

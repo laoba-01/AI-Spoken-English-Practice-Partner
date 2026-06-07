@@ -37,12 +37,23 @@ export interface Message {
   created_at: string
 }
 
+/** 纠错项 */
+export interface CorrectionItem {
+  type: 'grammar' | 'vocabulary' | 'pronunciation'
+  original: string
+  correction: string
+  explanation: string
+}
+
 /** 服务端 WebSocket 消息 */
 export interface WSMessage {
-  type: 'asr_result' | 'llm_chunk' | 'audio_result' | 'error'
+  type: 'asr_result' | 'asr_interim' | 'llm_chunk' | 'audio_result' | 'correction_result' | 'error'
   text?: string
   audio_url?: string
   message?: string
+  correction?: string              // JSON string of corrections
+  corrections?: CorrectionItem[]   // parsed corrections array
+  pronunciation_score?: number     // 0-100
 }
 
 /** API 统一响应 */

@@ -3,19 +3,24 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	swaggerFiles "github.com/swaggo/files"
+	ginSwagger "github.com/swaggo/gin-swagger"
 	"github.com/joho/godotenv"
 	"github.com/sashabaranov/go-openai"
 
+	_ "english-tutor/docs"
 	"english-tutor/internel/momel"
 	"english-tutor/internel/momel/package/pkg/asr"
 	"english-tutor/internel/momel/package/pkg/oss"
@@ -67,6 +72,11 @@ func GetSystemPrompt(scene string) string {
 	}
 }
 
+// @title           AI 英语口语陪练 API
+// @version         1.0
+// @description     支持实时语音对话和文字对话的 AI 英语口语陪练平台
+// @host            localhost:8080
+// @BasePath        /api
 func main() {
 	// 加载 .env 文件
 	if err := godotenv.Load(); err != nil {
@@ -121,8 +131,9 @@ func main() {
 	r.GET("/ws/chat", WebSocketHandler)
 	r.GET("/ws/chat/:id", WebSocketHandler)
 
-	// REST API接口
+	// REST API接口（含限流中间件）
 	api := r.Group("/api")
+	api.Use(rateLimiter())
 	{
 		api.POST("/conversations", CreateConversationHandler)
 		api.GET("/conversations", ListConversationsHandler)
@@ -131,8 +142,12 @@ func main() {
 		api.DELETE("/conversations/:id", DeleteConversationHandler)
 	}
 
+	// Swagger 文档
+	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+
 	// 启动服务
 	log.Println("服务器启动在 :8080")
+	log.Println("Swagger 文档: http://localhost:8080/swagger/index.html")
 	log.Fatal(r.Run(":8080"))
 }
 
@@ -167,6 +182,85 @@ func requestLogger() gin.HandlerFunc {
 	}
 }
 
+// ==================== 限流中间件 ====================
+
+// rateLimiter 基于 IP 的滑动窗口限流：每分钟最多 10 次请求
+func rateLimiter() gin.HandlerFunc {
+	type window struct {
+		mu        sync.Mutex
+		timestamps []time.Time
+	}
+	var (
+		clients  = make(map[string]*window)
+		mu       sync.Mutex
+		maxReq   = 10
+		interval = 1 * time.Minute
+	)
+
+	// 定期清理过期客户端（每 5 分钟）
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+			mu.Lock()
+			for ip, w := range clients {
+				w.mu.Lock()
+				cutoff := time.Now().Add(-interval)
+				valid := w.timestamps[:0]
+				for _, t := range w.timestamps {
+					if t.After(cutoff) {
+						valid = append(valid, t)
+					}
+				}
+				w.timestamps = valid
+				if len(valid) == 0 {
+					delete(clients, ip)
+				}
+				w.mu.Unlock()
+			}
+			mu.Unlock()
+		}
+	}()
+
+	return func(c *gin.Context) {
+		ip := c.ClientIP()
+
+		mu.Lock()
+		w, exists := clients[ip]
+		if !exists {
+			w = &window{}
+			clients[ip] = w
+		}
+		mu.Unlock()
+
+		w.mu.Lock()
+		defer w.mu.Unlock()
+
+		now := time.Now()
+		cutoff := now.Add(-interval)
+
+		// 清理过期时间戳
+		valid := w.timestamps[:0]
+		for _, t := range w.timestamps {
+			if t.After(cutoff) {
+				valid = append(valid, t)
+			}
+		}
+		w.timestamps = valid
+
+		if len(w.timestamps) >= maxReq {
+			c.JSON(429, gin.H{
+				"code":    -1,
+				"message": "请求过于频繁，请稍后再试",
+			})
+			c.Abort()
+			return
+		}
+
+		w.timestamps = append(w.timestamps, now)
+		c.Next()
+	}
+}
+
 // WebSocketHandler WebSocket处理函数
 func WebSocketHandler(c *gin.Context) {
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
@@ -195,11 +289,16 @@ func WebSocketHandler(c *gin.Context) {
 		var userText string
 
 		if msgType == websocket.BinaryMessage {
-			// === 语音消息：ASR → 发送识别结果 ===
+			// === 语音消息：ASR 流式识别（边说边转）===
 			log.Printf("收到语音消息，大小: %d bytes", len(msg))
 
 			asrStart := time.Now()
-			recognizedText, err := asrClient.RecognizeWebM(msg)
+			recognizedText, err := asrClient.RecognizeWebMStreaming(msg, func(interim string) {
+					conn.WriteJSON(map[string]interface{}{
+						"type": "asr_interim",
+						"text": interim,
+					})
+				})
 			log.Printf("ASR耗时: %.2fs, 文本: %s", time.Since(asrStart).Seconds(), recognizedText)
 			if err != nil {
 				log.Println("ASR识别失败:", err)
@@ -227,10 +326,47 @@ func WebSocketHandler(c *gin.Context) {
 			log.Println("收到用户消息:", userText)
 		}
 
+		// 空文本跳过（ASR 无结果等）
+		if userText == "" {
+			conn.WriteJSON(map[string]interface{}{
+				"type":    "error",
+				"message": "Sorry, I didn't catch that. Could you say it again?",
+			})
+			continue
+		}
+
 		// 保存用户消息
 		if cid > 0 {
 			model.SaveMessage(cid, "user", userText, "")
 		}
+
+		// 异步纠错分析（不阻塞主流程）
+		go func(uid int64, text string) {
+			result, err := analyzeErrors(text)
+			if err != nil {
+				log.Println("纠错分析失败:", err)
+				return
+			}
+			if result == nil || len(result.Corrections) == 0 && result.PronunciationScore == 0 {
+				return
+			}
+
+			// 序列化纠错内容
+			corrJSON, _ := json.Marshal(result.Corrections)
+
+			// 推送纠错结果到前端
+			conn.WriteJSON(map[string]interface{}{
+				"type":                "correction_result",
+				"correction":          string(corrJSON),
+				"corrections":         result.Corrections,
+				"pronunciation_score": result.PronunciationScore,
+			})
+
+			// 更新数据库中的纠错和评分
+			if uid > 0 {
+				model.UpdateLastUserMessage(uid, string(corrJSON), result.PronunciationScore)
+			}
+		}(cid, userText)
 
 		// 确定场景提示词 + 加载历史
 		systemPrompt := DailyPrompt
@@ -245,26 +381,61 @@ func WebSocketHandler(c *gin.Context) {
 			}
 		}
 
-		// === LLM 流式生成回复 ===
-		fullText, err := streamLLM(systemPrompt, history, userText, conn)
+		// === LLM 流式生成 + TTS 预生成（并行）===
+		type ttsPreResult struct {
+			prefix string
+			audio  []byte
+		}
+		ttsPreChan := make(chan ttsPreResult, 1)
+		var ttsPreOnce sync.Once
+
+		fullText, err := streamLLM(systemPrompt, history, userText, conn, func(prefix string) {
+			ttsPreOnce.Do(func() {
+				go func() {
+					log.Printf("TTS预生成启动（前缀%d字）", len(prefix))
+					audio, err := ttsClient.TextToMP3(prefix)
+					if err != nil {
+						log.Println("TTS预生成失败:", err)
+						return
+					}
+					ttsPreChan <- ttsPreResult{prefix: prefix, audio: audio}
+				}()
+			})
+		})
 		if err != nil {
 			log.Println("LLM调用失败:", err)
 			conn.WriteJSON(map[string]interface{}{
 				"type":    "error",
-				"message": "System is busy, please try again later.",
+				"message": fmt.Sprintf("系统繁忙，请稍后再试 (%v)", err),
 			})
 			continue
 		}
 
 		log.Println("AI回复:", fullText)
 
-		// === TTS 语音合成 ===
+		// === TTS 语音合成（优先使用预生成结果）===
 		ttsStart := time.Now()
-		audioData, err := ttsClient.TextToMP3(fullText)
+		var audioData []byte
+
+		// 尝试获取预生成的 TTS 结果
+		select {
+		case pre := <-ttsPreChan:
+			if pre.prefix == fullText {
+				// 预生成刚好覆盖全部回复，直接使用
+				audioData = pre.audio
+				log.Printf("TTS预生成命中，节省%.2fs", time.Since(ttsStart).Seconds())
+			} else {
+				// 前缀不匹配，需要合成全文
+				log.Printf("TTS预生成部分命中（前缀%d/全文%d字），合成全文", len(pre.prefix), len(fullText))
+				audioData, err = ttsClient.TextToMP3(fullText)
+			}
+		default:
+			// 预生成还没完成，正常合成
+			audioData, err = ttsClient.TextToMP3(fullText)
+		}
 		log.Printf("TTS耗时: %.2fs", time.Since(ttsStart).Seconds())
 		if err != nil {
 			log.Println("TTS合成失败（AI文字回复已发送，跳过语音）:", err)
-			// 保存文字消息（无语音）
 			if cid > 0 {
 				model.SaveMessage(cid, "assistant", fullText, "")
 			}
@@ -345,11 +516,15 @@ func isContentSafety(err error) bool {
 }
 
 // streamLLM 调用豆包LLM流式生成，实时推送每个chunk到前端（含重试）
-func streamLLM(systemPrompt string, history []model.Message, userText string, conn *websocket.Conn) (string, error) {
+// onEnoughText: 当 LLM 已生成足够文本（约3句话）时回调一次，用于TTS预生成
+func streamLLM(systemPrompt string, history []model.Message, userText string, conn *websocket.Conn, onEnoughText func(prefix string)) (string, error) {
 	messages := []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
 	}
 	for _, m := range history {
+			if m.Content == "" {
+				continue // skip empty content messages
+			}
 		messages = append(messages, openai.ChatCompletionMessage{
 			Role:    m.Role,
 			Content: m.Content,
@@ -397,6 +572,9 @@ func streamLLM(systemPrompt string, history []model.Message, userText string, co
 		var fullText strings.Builder
 		streamOK := true
 
+		var sentences int
+		var preGenOnce sync.Once
+
 		for {
 			resp, err := stream.Recv()
 			if err != nil {
@@ -420,6 +598,20 @@ func streamLLM(systemPrompt string, history []model.Message, userText string, co
 					"type": "llm_chunk",
 					"text": chunk,
 				})
+
+				// TTS 预生成：检测句子边界，攒够 3 句后触发
+				if onEnoughText != nil {
+					for _, c := range chunk {
+						if c == '.' || c == '!' || c == '?' {
+							sentences++
+						}
+					}
+					if sentences >= 3 {
+						preGenOnce.Do(func() {
+							onEnoughText(fullText.String())
+						})
+					}
+				}
 			}
 		}
 		stream.Close()
@@ -442,6 +634,16 @@ func streamLLM(systemPrompt string, history []model.Message, userText string, co
 // ==================== REST API Handlers ====================
 
 // CreateConversationHandler POST /api/conversations
+// CreateConversationHandler 创建新会话
+// @Summary      创建新会话
+// @Description  创建一个新的英语口语陪练会话
+// @Tags         会话管理
+// @Accept       json
+// @Produce      json
+// @Param        body  body  object  true  "请求参数"  example({"user_id":123,"scene":"daily"})
+// @Success      200  {object}  map[string]interface{}
+// @Router       /conversations [post]
+
 func CreateConversationHandler(c *gin.Context) {
 	var req struct {
 		UserID int64  `json:"user_id"`
@@ -470,6 +672,16 @@ func CreateConversationHandler(c *gin.Context) {
 }
 
 // ListConversationsHandler GET /api/conversations?user_id=&scene=
+// ListConversationsHandler 获取用户会话列表
+// @Summary      获取会话列表
+// @Description  获取用户的所有会话，可按场景筛选
+// @Tags         会话管理
+// @Produce      json
+// @Param        user_id  query  int   true   "用户ID"
+// @Param        scene    query  string false "场景: daily/business/exam"
+// @Success      200  {object}  map[string]interface{}
+// @Router       /conversations [get]
+
 func ListConversationsHandler(c *gin.Context) {
 	userIDStr := c.Query("user_id")
 	scene := c.DefaultQuery("scene", "")
@@ -495,6 +707,15 @@ func ListConversationsHandler(c *gin.Context) {
 }
 
 // GetConversationHandler GET /api/conversations/:id
+// GetConversationHandler 获取会话历史
+// @Summary      获取会话历史消息
+// @Description  获取指定会话的所有历史消息
+// @Tags         会话管理
+// @Produce      json
+// @Param        id  path  int  true  "会话ID"
+// @Success      200  {object}  map[string]interface{}
+// @Router       /conversations/{id} [get]
+
 func GetConversationHandler(c *gin.Context) {
 	idStr := c.Param("id")
 	var id int64
@@ -529,6 +750,16 @@ func GetConversationHandler(c *gin.Context) {
 }
 
 // TextMessageHandler POST /api/message/text (文字兜底)
+// TextMessageHandler 文字消息兜底
+// @Summary      发送文字消息
+// @Description  当语音不可用时，通过文字进行对话
+// @Tags         消息
+// @Accept       json
+// @Produce      json
+// @Param        body  body  object  true  "请求参数"  example({"conversation_id":789,"content":"Hello"})
+// @Success      200  {object}  map[string]interface{}
+// @Router       /message/text [post]
+
 func TextMessageHandler(c *gin.Context) {
 	var req struct {
 		ConversationID int64  `json:"conversation_id"`
@@ -536,6 +767,11 @@ func TextMessageHandler(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"code": -1, "message": "invalid request"})
+		return
+	}
+
+	if req.Content == "" {
+		c.JSON(400, gin.H{"code": -1, "message": "content is required"})
 		return
 	}
 
@@ -562,6 +798,9 @@ func TextMessageHandler(c *gin.Context) {
 		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
 	}
 	for _, m := range history {
+			if m.Content == "" {
+				continue // skip empty content messages
+			}
 		messages = append(messages, openai.ChatCompletionMessage{
 			Role:    m.Role,
 			Content: m.Content,
@@ -693,6 +932,15 @@ func TextMessageHandler(c *gin.Context) {
 }
 
 // DeleteConversationHandler DELETE /api/conversations/:id
+// DeleteConversationHandler 删除会话
+// @Summary      删除会话
+// @Description  删除指定会话及其所有消息
+// @Tags         会话管理
+// @Produce      json
+// @Param        id  path  int  true  "会话ID"
+// @Success      200  {object}  map[string]interface{}
+// @Router       /conversations/{id} [delete]
+
 func DeleteConversationHandler(c *gin.Context) {
 	idStr := c.Param("id")
 	var id int64
@@ -705,4 +953,79 @@ func DeleteConversationHandler(c *gin.Context) {
 	}
 
 	c.JSON(200, gin.H{"code": 0, "message": "success"})
+}
+
+// ==================== 纠错与发音评分 ====================
+
+// CorrectionItem 单个纠错项
+type CorrectionItem struct {
+	Type        string `json:"type"`        // grammar / vocabulary / pronunciation
+	Original    string `json:"original"`    // 用户原文片段
+	Correction  string `json:"correction"`  // 建议修改
+	Explanation string `json:"explanation"` // 解释说明
+}
+
+// CorrectionResult LLM 纠错分析结果
+type CorrectionResult struct {
+	Corrections        []CorrectionItem `json:"corrections"`
+	PronunciationScore int              `json:"pronunciation_score"` // 0-100
+}
+
+// 纠错专用 System Prompt
+const correctionPrompt = `You are an English error analyzer. Analyze the user's sentence.
+Return ONLY a JSON object (no markdown, no extra text) with this exact structure:
+{
+  "corrections": [
+    {"type": "grammar", "original": "wrong part", "correction": "correct version", "explanation": "brief reason"},
+    {"type": "vocabulary", "original": "wrong word", "correction": "better word", "explanation": "brief reason"}
+  ],
+  "pronunciation_score": 85
+}
+
+Rules:
+- "type" must be one of: "grammar", "vocabulary", "pronunciation"
+- "original" should be the exact error fragment from the user's sentence
+- "pronunciation_score": estimate 0-100 based on grammar/vocabulary quality (not actual speech)
+- If no errors found, return {"corrections": [], "pronunciation_score": 95}
+- Do NOT include any text outside the JSON.`
+
+// analyzeErrors 调用 LLM 分析用户文本中的错误（非流式，异步调用）
+func analyzeErrors(userText string) (*CorrectionResult, error) {
+	messages := []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleSystem, Content: correctionPrompt},
+		{Role: openai.ChatMessageRoleUser, Content: userText},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req := openai.ChatCompletionRequest{
+		Model:       "doubao-seed-2-0-pro-260215",
+		Messages:    messages,
+		Temperature: 0.3, // 低温度，确保输出稳定
+		MaxTokens:   300,
+	}
+
+	resp, err := llmClient.CreateChatCompletion(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("纠错LLM调用失败: %w", err)
+	}
+
+	if len(resp.Choices) == 0 {
+		return nil, fmt.Errorf("纠错LLM返回空结果")
+	}
+
+	content := strings.TrimSpace(resp.Choices[0].Message.Content)
+	// 清理可能的 markdown 代码块包裹
+	content = strings.TrimPrefix(content, "```json")
+	content = strings.TrimPrefix(content, "```")
+	content = strings.TrimSuffix(content, "```")
+	content = strings.TrimSpace(content)
+
+	var result CorrectionResult
+	if err := json.Unmarshal([]byte(content), &result); err != nil {
+		return nil, fmt.Errorf("纠错JSON解析失败: %w, content: %s", err, content)
+	}
+
+	return &result, nil
 }

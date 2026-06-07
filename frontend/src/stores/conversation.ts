@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { Conversation, Message, Scene } from '@/types'
+import type { Conversation, Message, Scene, CorrectionItem } from '@/types'
 import * as api from '@/api'
 
 export const useConversationStore = defineStore('conversation', () => {
@@ -93,6 +93,26 @@ export const useConversationStore = defineStore('conversation', () => {
     return res.code === 0
   }
 
+  /** 更新最后一条用户消息的纠错和评分 */
+  function updateLastUserMessageCorrection(
+    conversationId: number,
+    correctionJson: string,
+    corrections: CorrectionItem[],
+    score: number
+  ) {
+    // 从后往前找最后一条 user 消息
+    for (let i = messages.value.length - 1; i >= 0; i--) {
+      const msg = messages.value[i]
+      if (msg.role === 'user' && msg.conversation_id === conversationId) {
+        msg.correction = correctionJson
+        msg.pronunciation_score = score
+        // 触发响应式更新
+        messages.value = [...messages.value]
+        return
+      }
+    }
+  }
+
   /** 清空消息 */
   function clearMessages() {
     messages.value = []
@@ -110,6 +130,7 @@ export const useConversationStore = defineStore('conversation', () => {
     fetchConversations,
     fetchMessages,
     addMessage,
+    updateLastUserMessageCorrection,
     clearMessages,
     deleteConversation,
   }

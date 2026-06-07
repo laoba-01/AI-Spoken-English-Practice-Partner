@@ -1,0 +1,9 @@
+basePath: /api
+host: localhost:8080
+info:
+  contact: {}
+  description: 支持实时语音对话和文字对话的 AI 英语口语陪练平台
+  title: AI 英语口语陪练 API
+  version: "1.0"
+paths: {}
+swagger: "2.0"
