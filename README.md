@@ -2,6 +2,8 @@
 
 基于 Go + Vue 3 的 AI 英语口语陪练平台，支持实时语音对话和文字对话双模式。
 
+📺 **视频讲解**：[Bilibili 视频链接](https://www.bilibili.com/video/BV1QmEt6UEtY/?spm_id_from=333.1387.homepage.video_card.click&vd_source=a2079db34558e2a8f37ec37b6c8edf80)
+
 ## 功能特性
 
 ### 核心功能
