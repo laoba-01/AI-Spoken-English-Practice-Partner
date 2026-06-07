@@ -2,6 +2,7 @@
 package model
 
 import (
+	"context"
 	"database/sql"
 	"log"
 	"os"
@@ -9,9 +10,11 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/redis/go-redis/v9"
 )
 
 var DB *sql.DB
+var RedisClient *redis.Client
 
 // 内存存储（当数据库不可用时的 fallback）
 var (
@@ -63,6 +66,29 @@ type Message struct {
 	Correction        string `json:"correction"`
 	PronunciationScore int8  `json:"pronunciation_score"`
 	CreatedAt         string `json:"created_at"`
+}
+
+// ─── Redis 缓存 ───
+
+func InitRedis() error {
+	addr := os.Getenv("REDIS_ADDR")
+	if addr == "" {
+		log.Println("⚠ 未配置 REDIS_ADDR，不使用缓存")
+		return nil
+	}
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     addr,
+		Password: os.Getenv("REDIS_PASSWORD"),
+		DB:       0,
+	})
+	ctx := context.Background()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		log.Println("⚠ Redis连接失败，不使用缓存:", err)
+		return nil
+	}
+	RedisClient = rdb
+	log.Println("✓ Redis缓存已启用 (addr=" + addr + ")")
+	return nil
 }
 
 // ─── 内存存储辅助 ───
