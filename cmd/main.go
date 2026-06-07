@@ -73,6 +73,11 @@ func main() {
 		log.Println("⚠ 数据库连接失败，对话记录不会保存:", err)
 	}
 
+	// 初始化Redis缓存（非致命）
+	if err := model.InitRedis(); err != nil {
+		log.Println("⚠ Redis缓存连接失败:", err)
+	}
+
 	// 创建音频文件存储目录
 	os.MkdirAll("./audio", 0755)
 
