@@ -1,0 +1,25 @@
+# Git
+.git
+.gitignore
+
+# Frontend (not needed in backend image)
+frontend/
+node_modules/
+
+# Local binaries
+*.exe
+english-tutor
+
+# Audio files (local test data)
+audio/
+
+# IDE
+.vscode/
+.idea/
+
+# Docs (except Swagger)
+docs/superpowers/
+
+# Environment
+.env.local
+.env.example

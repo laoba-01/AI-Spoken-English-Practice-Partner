@@ -1,0 +1,70 @@
+version: "3.8"
+
+services:
+  app:
+    build: .
+    container_name: english-tutor
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      - MYSQL_DSN=${MYSQL_USER:-tutor}:${MYSQL_PASSWORD:-tutor123}@tcp(mysql:3306)/english_tutor?charset=utf8mb4&parseTime=True&loc=Local
+      - REDIS_ADDR=redis:6379
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - app_audio:/app/audio
+    networks:
+      - tutor-network
+
+  mysql:
+    image: mysql:8.0
+    container_name: tutor-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root123}
+      MYSQL_DATABASE: english_tutor
+      MYSQL_USER: ${MYSQL_USER:-tutor}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-tutor123}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-root123}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - tutor-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: tutor-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - tutor-network
+
+volumes:
+  mysql_data:
+  redis_data:
+  app_audio:
+
+networks:
+  tutor-network:
+    driver: bridge
