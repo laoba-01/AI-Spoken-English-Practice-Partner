@@ -385,15 +385,9 @@ func GetConversationHandler(c *gin.Context) {
 	}
 
 	// 获取会话基本信息
-	convs, _ := model.GetConversationsByUserID(0, "")
-	scene := "daily"
-	title := ""
-	for _, conv := range convs {
-		if conv.ID == id {
-			scene = conv.Scene
-			title = conv.Title
-			break
-		}
+	scene, _ := model.GetConversationScene(id)
+	if scene == "" {
+		scene = "daily"
 	}
 
 	c.JSON(200, gin.H{
@@ -402,7 +396,7 @@ func GetConversationHandler(c *gin.Context) {
 		"data": gin.H{
 			"conversation_id": id,
 			"scene":           scene,
-			"title":           title,
+			"title":           "",
 			"messages":        messages,
 		},
 	})
