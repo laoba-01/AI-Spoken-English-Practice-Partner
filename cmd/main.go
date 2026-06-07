@@ -18,6 +18,7 @@ import (
 
 	"english-tutor/internel/momel"
 	"english-tutor/internel/momel/package/pkg/asr"
+	"english-tutor/internel/momel/package/pkg/oss"
 	"english-tutor/internel/momel/package/pkg/tts"
 )
 
@@ -26,6 +27,7 @@ var (
 	llmClient *openai.Client
 	asrClient *asr.AliyunASR
 	ttsClient *tts.AliyunTTS
+	ossClient *oss.AliyunOSS
 	upgrader  = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true // 开发环境允许所有跨域
@@ -100,6 +102,9 @@ func main() {
 	if err := model.InitRedis(); err != nil {
 		log.Println("⚠ Redis缓存连接失败:", err)
 	}
+
+	// 初始化OSS客户端（非致命）
+	ossClient = oss.NewAliyunOSS()
 
 	// 创建音频文件存储目录
 	os.MkdirAll("./audio", 0755)
@@ -208,16 +213,21 @@ func WebSocketHandler(c *gin.Context) {
 			model.SaveMessage(cid, "user", userText, "")
 		}
 
-		// 确定场景提示词
+		// 确定场景提示词 + 加载历史
 		systemPrompt := DailyPrompt
+		var history []model.Message
 		if cid > 0 {
 			if scene, err := model.GetConversationScene(cid); err == nil {
 				systemPrompt = GetSystemPrompt(scene)
 			}
+			history, _ = model.GetMessagesByConversationID(cid)
+			if len(history) > 10 {
+				history = history[len(history)-10:]
+			}
 		}
 
 		// === LLM 流式生成回复 ===
-		fullText, err := streamLLM(systemPrompt, userText, conn)
+		fullText, err := streamLLM(systemPrompt, history, userText, conn)
 		if err != nil {
 			log.Println("LLM调用失败:", err)
 			conn.WriteJSON(map[string]interface{}{
@@ -240,19 +250,31 @@ func WebSocketHandler(c *gin.Context) {
 			continue
 		}
 
-		// 保存音频文件到本地
+		// === 存储音频（优先 OSS → 本地降级）===
 		audioFilename := fmt.Sprintf("tts_%d.mp3", time.Now().UnixNano())
-		audioPath := fmt.Sprintf("./audio/%s", audioFilename)
-		if err := os.WriteFile(audioPath, audioData, 0644); err != nil {
-			log.Println("保存音频文件失败:", err)
-			if cid > 0 {
-				model.SaveMessage(cid, "assistant", fullText, "")
+		audioURL := ""
+
+		if ossClient != nil {
+			if url, err := ossClient.UploadMP3(audioData, audioFilename); err == nil {
+				audioURL = url
+				log.Println("音频已上传 OSS:", audioURL)
+			} else {
+				log.Println("OSS上传失败，降级本地:", err)
 			}
-			continue
+		}
+		if audioURL == "" {
+			audioPath := fmt.Sprintf("./audio/%s", audioFilename)
+			if err := os.WriteFile(audioPath, audioData, 0644); err != nil {
+				log.Println("保存音频文件失败:", err)
+				if cid > 0 {
+					model.SaveMessage(cid, "assistant", fullText, "")
+				}
+				continue
+			}
+			audioURL = fmt.Sprintf("/audio/%s", audioFilename)
 		}
 
 		// 推送TTS语音URL给前端
-		audioURL := fmt.Sprintf("/audio/%s", audioFilename)
 		conn.WriteJSON(map[string]interface{}{
 			"type":      "audio_result",
 			"audio_url": audioURL,
@@ -268,13 +290,24 @@ func WebSocketHandler(c *gin.Context) {
 }
 
 // streamLLM 调用豆包LLM流式生成，实时推送每个chunk到前端
-func streamLLM(systemPrompt, userText string, conn *websocket.Conn) (string, error) {
+func streamLLM(systemPrompt string, history []model.Message, userText string, conn *websocket.Conn) (string, error) {
+	messages := []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
+	}
+	for _, m := range history {
+		messages = append(messages, openai.ChatCompletionMessage{
+			Role:    m.Role,
+			Content: m.Content,
+		})
+	}
+	messages = append(messages, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: userText,
+	})
+
 	req := openai.ChatCompletionRequest{
-		Model: "doubao-seed-2-0-pro-260215",
-		Messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
-			{Role: openai.ChatMessageRoleUser, Content: userText},
-		},
+		Model:    "doubao-seed-2-0-pro-260215",
+		Messages: messages,
 		Stream:      true,
 		Temperature: 0.7,
 		MaxTokens:   500,
@@ -418,13 +451,33 @@ func TextMessageHandler(c *gin.Context) {
 		model.SaveMessage(req.ConversationID, "user", req.Content, "")
 	}
 
-	// 确定场景提示词
+	// 确定场景提示词 + 加载历史
 	systemPrompt := DailyPrompt
+	var history []model.Message
 	if req.ConversationID > 0 {
 		if scene, err := model.GetConversationScene(req.ConversationID); err == nil {
 			systemPrompt = GetSystemPrompt(scene)
 		}
+		history, _ = model.GetMessagesByConversationID(req.ConversationID)
+		if len(history) > 10 {
+			history = history[len(history)-10:]
+		}
 	}
+
+	// 构建消息列表
+	messages := []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
+	}
+	for _, m := range history {
+		messages = append(messages, openai.ChatCompletionMessage{
+			Role:    m.Role,
+			Content: m.Content,
+		})
+	}
+	messages = append(messages, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: req.Content,
+	})
 
 	// 调用 LLM（非流式，通过管道收集）
 	pr, pw := io.Pipe()
@@ -433,11 +486,8 @@ func TextMessageHandler(c *gin.Context) {
 	go func() {
 		defer pw.Close()
 		llmReq := openai.ChatCompletionRequest{
-			Model: "doubao-seed-2-0-pro-260215",
-			Messages: []openai.ChatCompletionMessage{
-				{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
-				{Role: openai.ChatMessageRoleUser, Content: req.Content},
-			},
+			Model:       "doubao-seed-2-0-pro-260215",
+			Messages:    messages,
 			Stream:      true,
 			Temperature: 0.7,
 			MaxTokens:   500,
@@ -467,14 +517,23 @@ func TextMessageHandler(c *gin.Context) {
 		fullText.Write(data[:n])
 	}
 
-	// TTS 合成
+	// TTS 合成 + 存储（优先 OSS → 本地降级）
 	audioURL := ""
 	audioData, err := ttsClient.TextToMP3(fullText.String())
 	if err == nil {
 		filename := fmt.Sprintf("tts_%d.mp3", time.Now().UnixNano())
-		path := fmt.Sprintf("./audio/%s", filename)
-		if os.WriteFile(path, audioData, 0644) == nil {
-			audioURL = fmt.Sprintf("/audio/%s", filename)
+		if ossClient != nil {
+			if url, err := ossClient.UploadMP3(audioData, filename); err == nil {
+				audioURL = url
+			} else {
+				log.Println("OSS上传失败，降级本地:", err)
+			}
+		}
+		if audioURL == "" {
+			path := fmt.Sprintf("./audio/%s", filename)
+			if os.WriteFile(path, audioData, 0644) == nil {
+				audioURL = fmt.Sprintf("/audio/%s", filename)
+			}
 		}
 	}
 
